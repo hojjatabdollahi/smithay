@@ -480,6 +480,105 @@ impl<'a> KeysymHandle<'a> {
     }
 }
 
+/// A keyboard state owned by a secondary input source (e.g. a libei remote-desktop
+/// connection) and kept fully isolated from the seat's shared keyboard state.
+///
+/// Use with [`KeyboardHandle::input_isolated`] so modifier tracking and shortcut matching
+/// for that source never contaminate or get contaminated by the physical keyboard.
+pub struct IsolatedKeyboardState {
+    xkb: Arc<Mutex<Xkb>>,
+    mods_state: ModifiersState,
+    pressed_keys: HashSet<Keycode>,
+    #[cfg(feature = "wayland_frontend")]
+    keymap: KeymapFile,
+}
+
+impl fmt::Debug for IsolatedKeyboardState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsolatedKeyboardState")
+            .field("xkb", &self.xkb)
+            .field("mods_state", &self.mods_state)
+            .field("pressed_keys", &self.pressed_keys)
+            .finish()
+    }
+}
+
+// This is OK because all parts of `xkb` will remain on the same thread.
+unsafe impl Send for IsolatedKeyboardState {}
+
+impl IsolatedKeyboardState {
+    /// Create a new isolated keyboard state with the given XKB configuration.
+    pub fn new(xkb_config: XkbConfig<'_>) -> Result<Self, Error> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb_config
+            .compile_keymap(&context)
+            .map_err(|()| Error::BadKeymap)?;
+        let state = xkb::State::new(&keymap);
+        #[cfg(feature = "wayland_frontend")]
+        let keymap_file = KeymapFile::new(&keymap);
+        Ok(IsolatedKeyboardState {
+            xkb: Arc::new(Mutex::new(Xkb {
+                context,
+                keymap,
+                state,
+            })),
+            mods_state: ModifiersState::default(),
+            pressed_keys: HashSet::new(),
+            #[cfg(feature = "wayland_frontend")]
+            keymap: keymap_file,
+        })
+    }
+
+    /// The modifier state currently held by this source.
+    pub fn modifier_state(&self) -> ModifiersState {
+        self.mods_state
+    }
+
+    /// Resolve a keysym to a keycode that produces it in the currently active layout.
+    ///
+    /// Returns `None` if no key in the active layout produces the keysym. The required
+    /// shift level / modifiers are not synthesized
+    pub fn keycode_for_keysym(&self, keysym: Keysym) -> Option<Keycode> {
+        let xkb = self.xkb.lock().unwrap();
+        let layout = xkb.state.serialize_layout(XKB_STATE_LAYOUT_EFFECTIVE);
+        for raw in xkb.keymap.min_keycode().raw()..=xkb.keymap.max_keycode().raw() {
+            let keycode = Keycode::new(raw);
+            for level in 0..xkb.keymap.num_levels_for_key(keycode, layout) {
+                if xkb
+                    .keymap
+                    .key_get_syms_by_level(keycode, layout, level)
+                    .contains(&keysym)
+                {
+                    return Some(keycode);
+                }
+            }
+        }
+        None
+    }
+
+    /// Update the isolated state with a key press/release. Returns whether the modifier
+    /// state changed.
+    #[cfg(feature = "wayland_frontend")]
+    fn key_input(&mut self, keycode: Keycode, state: KeyState) -> bool {
+        let direction = match state {
+            KeyState::Pressed => {
+                self.pressed_keys.insert(keycode);
+                xkb::KeyDirection::Down
+            }
+            KeyState::Released => {
+                self.pressed_keys.remove(&keycode);
+                xkb::KeyDirection::Up
+            }
+        };
+        let mut xkb = self.xkb.lock().unwrap();
+        let changed = xkb.state.update_key(keycode, direction) != 0;
+        if changed {
+            self.mods_state.update_with(&xkb.state);
+        }
+        changed
+    }
+}
+
 /// The currently active state of the Xkb.
 pub struct XkbContext<'a> {
     xkb: &'a Mutex<Xkb>,
@@ -1198,6 +1297,68 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             .find(|seat| seat.get_keyboard().map(|h| &h == self).unwrap_or(false))
             .cloned()
             .unwrap()
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl<D> KeyboardHandle<D>
+where
+    D: SeatHandler + 'static,
+    <D as SeatHandler>::KeyboardFocus: crate::wayland::seat::WaylandFocus,
+{
+    /// Like [`KeyboardHandle::input`], but driven by an external [`IsolatedKeyboardState`]
+    /// instead of the seat's shared keyboard state.
+    ///
+    /// The modifier state and the [`KeysymHandle`] handed to `filter` come from `state`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_isolated<T, F>(
+        &self,
+        data: &mut D,
+        state: &mut IsolatedKeyboardState,
+        keycode: Keycode,
+        key_state: KeyState,
+        serial: Serial,
+        time: u32,
+        filter: F,
+    ) -> Option<T>
+    where
+        F: FnOnce(&mut D, &ModifiersState, KeysymHandle<'_>) -> FilterResult<T>,
+    {
+        use crate::wayland::seat::WaylandFocus;
+        use wayland_server::protocol::wl_keyboard;
+
+        state.key_input(keycode, key_state);
+        let mods = state.mods_state;
+
+        let handle = KeysymHandle {
+            xkb: &state.xkb,
+            keycode,
+        };
+        match filter(data, &mods, handle) {
+            FilterResult::Intercept(value) => return Some(value),
+            FilterResult::Forward => {}
+        }
+
+        // Deliver to the focused client
+        let mut internal = self.arc.internal.lock().unwrap();
+        let focus = internal.focus.as_mut().map(|(focus, _)| focus);
+        let keymap_changed = self.send_keymap(data, &focus, &state.keymap, mods);
+        let seat = self.get_seat(data);
+        if let Some(focus) = focus {
+            if !keymap_changed {
+                focus.modifiers(&seat, data, mods, SERIAL_COUNTER.next_serial());
+            }
+            if let Some(surface) = focus.wl_surface() {
+                let wl_state = match key_state {
+                    KeyState::Pressed => wl_keyboard::KeyState::Pressed,
+                    KeyState::Released => wl_keyboard::KeyState::Released,
+                };
+                crate::wayland::seat::keyboard::for_each_focused_kbds(&seat, &surface, |kbd| {
+                    kbd.key(serial.0, time, keycode.raw() - 8, wl_state);
+                });
+            }
+        }
+        None
     }
 }
 
