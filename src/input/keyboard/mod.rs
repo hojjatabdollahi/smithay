@@ -555,13 +555,21 @@ impl IsolatedKeyboardState {
         self.mods_state
     }
 
+    /// The keycodes currently held down by this source.
+    ///
+    /// Useful for releasing source-held keys when the source disappears (e.g. a libei
+    /// connection drops or a virtual keyboard is destroyed), so they don't stay stuck down
+    /// in the focused client.
+    pub fn pressed_keys(&self) -> impl Iterator<Item = Keycode> + '_ {
+        self.pressed_keys.iter().copied()
+    }
+
     /// Update the modifier mask directly (e.g. from a `zwp_virtual_keyboard_v1::modifiers`
     /// request), without going through a key press.
     #[cfg(feature = "wayland_frontend")]
     pub fn update_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         let mut xkb = self.xkb.lock().unwrap();
-        xkb.state
-            .update_mask(depressed, latched, locked, 0, 0, group);
+        xkb.state.update_mask(depressed, latched, locked, 0, 0, group);
         self.mods_state.update_with(&xkb.state);
     }
 

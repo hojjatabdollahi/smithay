@@ -10,7 +10,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboar
     self, ZwpVirtualKeyboardV1,
 };
 use wayland_server::{
-    Client, DataInit, DisplayHandle, Resource, protocol::wl_keyboard::KeymapFormat,
+    Client, DataInit, DisplayHandle, Resource, backend::ClientId, protocol::wl_keyboard::KeymapFormat,
 };
 use xkbcommon::xkb;
 
@@ -124,8 +124,7 @@ where
                 let keyboard_handle = self.seat.get_keyboard().unwrap();
                 let mut internal = keyboard_handle.arc.internal.lock().unwrap();
                 let focus = internal.focus.as_mut().map(|(focus, _)| focus);
-                let keymap_changed =
-                    keyboard_handle.send_keymap(user_data, &focus, iso.keymap_file(), mods);
+                let keymap_changed = keyboard_handle.send_keymap(user_data, &focus, iso.keymap_file(), mods);
 
                 if !keymap_changed {
                     if let Some(focus) = focus {
@@ -134,9 +133,19 @@ where
                 }
             }
             zwp_virtual_keyboard_v1::Request::Destroy => {
-                // Nothing to do
+                // Held-key release happens in `destroyed`, which also covers clients that drop
+                // the object without an explicit destroy request.
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(&self, state: &mut D, _client: ClientId, _resource: &ZwpVirtualKeyboardV1) {
+        // Release any keys this virtual keyboard still holds, so they don't stick in the
+        // focused client.
+        let mut virtual_data = self.handle.inner.lock().unwrap();
+        if let Some(iso) = virtual_data.state.as_mut() {
+            state.virtual_keyboard_destroyed(&self.seat, iso);
         }
     }
 }
