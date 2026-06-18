@@ -529,9 +529,46 @@ impl IsolatedKeyboardState {
         })
     }
 
+    /// Create a new isolated keyboard state from an already-compiled keymap.
+    ///
+    /// Unlike [`IsolatedKeyboardState::new`], the layout is taken from a client-provided
+    /// keymap (e.g. a `zwp_virtual_keyboard_v1`'s uploaded keymap) rather than an
+    /// [`XkbConfig`]. The `context` must be the one the keymap was compiled with.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn new_from_keymap(context: xkb::Context, keymap: xkb::Keymap) -> Self {
+        let state = xkb::State::new(&keymap);
+        let keymap_file = KeymapFile::new(&keymap);
+        IsolatedKeyboardState {
+            xkb: Arc::new(Mutex::new(Xkb {
+                context,
+                keymap,
+                state,
+            })),
+            mods_state: ModifiersState::default(),
+            pressed_keys: HashSet::new(),
+            keymap: keymap_file,
+        }
+    }
+
     /// The modifier state currently held by this source.
     pub fn modifier_state(&self) -> ModifiersState {
         self.mods_state
+    }
+
+    /// Update the modifier mask directly (e.g. from a `zwp_virtual_keyboard_v1::modifiers`
+    /// request), without going through a key press.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn update_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        let mut xkb = self.xkb.lock().unwrap();
+        xkb.state
+            .update_mask(depressed, latched, locked, 0, 0, group);
+        self.mods_state.update_with(&xkb.state);
+    }
+
+    /// The serializable keymap for this source, used to send the layout to focused clients.
+    #[cfg(feature = "wayland_frontend")]
+    pub(crate) fn keymap_file(&self) -> &KeymapFile {
+        &self.keymap
     }
 
     /// Resolve a keysym to a keycode that produces it in the currently active layout.

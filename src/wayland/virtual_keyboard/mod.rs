@@ -51,7 +51,8 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::server::{
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, backend::GlobalId};
 
 use crate::{
-    input::{Seat, SeatHandler},
+    backend::input::{KeyState, Keycode},
+    input::{Seat, SeatHandler, keyboard::IsolatedKeyboardState},
     wayland::{Dispatch2, GlobalData, GlobalDispatch2},
 };
 
@@ -62,6 +63,26 @@ const MANAGER_VERSION: u32 = 1;
 mod virtual_keyboard_handle;
 
 pub use virtual_keyboard_handle::VirtualKeyboardUserData;
+
+/// Handler trait for `zwp_virtual_keyboard_v1` key events.
+///
+/// Each virtual keyboard keeps its own [`IsolatedKeyboardState`] (built from the client's uploaded keymap)
+pub trait VirtualKeyboardHandler: SeatHandler {
+    /// A virtual keyboard produced a key event.
+    fn virtual_keyboard_key(
+        &mut self,
+        seat: &Seat<Self>,
+        keyboard_state: &mut IsolatedKeyboardState,
+        keycode: Keycode,
+        key_state: KeyState,
+        time: u32,
+    );
+
+    /// A virtual keyboard was destroyed. The compositor should release any keys this source
+    /// still holds down (see [`IsolatedKeyboardState::pressed_keys`]) so they don't stay
+    /// stuck in the focused client.
+    fn virtual_keyboard_destroyed(&mut self, seat: &Seat<Self>, keyboard_state: &mut IsolatedKeyboardState);
+}
 
 /// State of wp misc virtual keyboard protocol
 #[derive(Debug)]
@@ -94,7 +115,7 @@ impl VirtualKeyboardManagerState {
         D: GlobalDispatch<ZwpVirtualKeyboardManagerV1, VirtualKeyboardManagerGlobalData>,
         D: Dispatch<ZwpVirtualKeyboardManagerV1, GlobalData>,
         D: Dispatch<ZwpVirtualKeyboardV1, VirtualKeyboardUserData<D>>,
-        D: SeatHandler,
+        D: SeatHandler + VirtualKeyboardHandler,
         D: 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
@@ -135,7 +156,7 @@ where
 impl<D> Dispatch2<ZwpVirtualKeyboardManagerV1, D> for GlobalData
 where
     D: Dispatch<ZwpVirtualKeyboardV1, VirtualKeyboardUserData<D>>,
-    D: SeatHandler,
+    D: SeatHandler + VirtualKeyboardHandler,
     D: 'static,
 {
     fn request(
