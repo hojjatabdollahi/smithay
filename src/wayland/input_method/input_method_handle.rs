@@ -32,6 +32,7 @@ pub(crate) struct InputMethod {
     pub instance: Option<Instance>,
     pub popup_handle: PopupHandle,
     pub keyboard_grab: InputMethodKeyboardGrab,
+    pub inhibited: bool,
 }
 
 #[derive(Debug)]
@@ -100,6 +101,20 @@ impl InputMethodHandle {
         keyboard.grab.is_some()
     }
 
+    /// Inhibit or allow input method activation.
+    ///
+    /// While inhibited, activation requests from text-input clients are
+    /// ignored, so the input method (e.g. an on-screen keyboard) is not shown.
+    /// The compositor uses this to gate auto-show.
+    pub fn set_inhibited(&self, inhibited: bool) {
+        self.inner.lock().unwrap().inhibited = inhibited;
+    }
+
+    /// Whether input method activation is currently inhibited.
+    pub fn is_inhibited(&self) -> bool {
+        self.inner.lock().unwrap().inhibited
+    }
+
     pub(crate) fn set_text_input_rectangle<D: SeatHandler + 'static>(
         &self,
         state: &mut D,
@@ -124,6 +139,10 @@ impl InputMethodHandle {
     /// Activate input method on the given surface.
     pub(crate) fn activate_input_method<D: SeatHandler + 'static>(&self, state: &mut D, surface: &WlSurface) {
         self.with_input_method(|im| {
+            // Compositor-gated: don't surface the input method while inhibited.
+            if im.inhibited {
+                return;
+            }
             if let Some(instance) = im.instance.as_ref() {
                 instance.object.activate();
                 if let Some(popup) = im.popup_handle.surface.as_mut() {
